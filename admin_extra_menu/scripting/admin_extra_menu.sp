@@ -10,6 +10,7 @@
 #include <adminmenu>
 
 #define PLUGIN_TAG "{O}[{D}AEM{O}] "
+#define GAMEDATA "admin_extra_menu"
 
 int
     g_iMaxClients,
@@ -39,6 +40,16 @@ static float
     g_fTempSpeed,
     g_fBurstEndTime[33],
     g_fBurstModifier;
+
+static const char g_sZombieClass[][] = {
+    "Smoker",
+    "Boomer",
+    "Hunter",
+    "Spitter",
+    "Jockey",
+    "Charger",
+    "Tank",
+};
 
 static const char
     g_sTargetTeam[][] = {
@@ -126,13 +137,7 @@ TopMenu
 Handle
     g_hSDK_TerrorNavMesh_GetLastCheckpoint,
     g_hSDK_Checkpoint_GetLargestArea,
-    g_hSDK_NextBotCreatePlayerBot_Smoker,
-    g_hSDK_NextBotCreatePlayerBot_Boomer,
-    g_hSDK_NextBotCreatePlayerBot_Hunter,
-    g_hSDK_NextBotCreatePlayerBot_Spitter,
-    g_hSDK_NextBotCreatePlayerBot_Jockey,
-    g_hSDK_NextBotCreatePlayerBot_Charger,
-    g_hSDK_NextBotCreatePlayerBot_Tank;
+    g_hSDK_NextBotCreatePlayerBot[7];
 
 TopMenuObject
     TMO_DirectorMenu,       // 导演设置菜单
@@ -178,12 +183,83 @@ static char g_sSpawnerModelName[4][] = {
 ConVar
     melee_range;
 
+enum struct SDKCallParamsWrapper {
+	SDKType type;
+	SDKPassMethod pass;
+	int decflags;
+	int encflags;
+}
+
+methodmap GameDataWrapper < GameData {
+	public GameDataWrapper(const char[] file) {
+		GameData gd = new GameData(file);
+		if (!gd) SetFailState("Missing gamedata \"%s\"", file);
+		return view_as<GameDataWrapper>(gd);
+	}
+		
+	property GameData Super {
+		public get() { return view_as<GameData>(this); }
+	}
+	
+	public int GetOffset(const char[] key) {
+		int offset = this.Super.GetOffset(key);
+		if (offset == -1) SetFailState("Missing offset \"%s\"", key);
+		return offset;
+	}
+
+	public Address GetAddress(const char[] key) {
+		Address ptr = this.Super.GetAddress(key);
+		return ptr;
+	}
+	public DynamicDetour CreateDetourOrFail(
+			const char[] name,
+			DHookCallback preHook = INVALID_FUNCTION,
+			DHookCallback postHook = INVALID_FUNCTION) {
+		DynamicDetour hSetup = DynamicDetour.FromConf(this, name);
+		if (!hSetup)
+			SetFailState("Missing detour setup \"%s\"", name);
+		if (preHook != INVALID_FUNCTION && !hSetup.Enable(Hook_Pre, preHook))
+			SetFailState("Failed to pre-detour \"%s\"", name);
+		if (postHook != INVALID_FUNCTION && !hSetup.Enable(Hook_Post, postHook))
+			SetFailState("Failed to post-detour \"%s\"", name);
+		return hSetup;
+	}
+	
+	public DynamicHook CreateDHookOrFail(const char[] name) {
+		DynamicHook hSetup = DynamicHook.FromConf(this, name);
+		if (!hSetup)
+			SetFailState("Missing dhook setup \"%s\"", name);
+		return hSetup;
+	}
+	public Handle CreateSDKCallOrFail(
+			SDKCallType type,
+			SDKFuncConfSource src,
+			const char[] name,
+			const SDKCallParamsWrapper[] params = {},
+			int numParams = 0,
+			bool hasReturnValue = false,
+			const SDKCallParamsWrapper ret = {}) {
+		static const char k_sSDKFuncConfSource[SDKFuncConfSource][] = { "offset", "signature", "address" };
+		Handle result;
+		StartPrepSDKCall(type);
+		if (!PrepSDKCall_SetFromConf(this, src, name))
+			SetFailState("Missing %s \"%s\"", k_sSDKFuncConfSource[src], name);
+		for (int i = 0; i < numParams; ++i)
+			PrepSDKCall_AddParameter(params[i].type, params[i].pass, params[i].decflags, params[i].encflags);
+		if (hasReturnValue)
+			PrepSDKCall_SetReturnInfo(ret.type, ret.pass, ret.decflags, ret.encflags);
+		if (!(result = EndPrepSDKCall()))
+			SetFailState("Failed to prep sdkcall \"%s\"", name);
+		return result;
+	}
+}
+
 public Plugin myinfo =
 {
     name = "L4D2 Admin Extra Menu",
     author = "Hitomi",
     description = "管理员菜单拓展",
-    version = "1.1",
+    version = "1.2",
     url = "https://github.com/cy115/"
 };
 
@@ -233,72 +309,57 @@ public void OnAllPluginsLoaded()
 // ------------------------------------------------------------ GameData ------------------------------------------------------------------------
 void LoadGameData()
 {
-    static char sPath[PLATFORM_MAX_PATH];
-    BuildPath(Path_SM, sPath, sizeof(sPath), "gamedata/admin_extra_menu.txt");
-    if (!FileExists(sPath)) {
-        SetFailState(">>> Missing required file: gamedata/admin_extra_menu.txt.");
-    }
+	GameDataWrapper gd = new GameDataWrapper(GAMEDATA);
+	g_iOff_m_nFallenSurvivors = gd.GetOffset("m_nFallenSurvivors");
+	g_iOff_m_FallenSurvivorTimer = gd.GetOffset("m_FallenSurvivorTimer");
+	SDKCallParamsWrapper ret  = { SDKType_PlainOldData, SDKPass_Plain };
+	g_hSDK_TerrorNavMesh_GetLastCheckpoint = gd.CreateSDKCallOrFail(SDKCall_Raw, SDKConf_Signature, "TerrorNavMesh::GetLastCheckpoint", _, _, true, ret);
 
-    GameData hGameData = new GameData("admin_extra_menu");
-    g_iOff_m_nFallenSurvivors = hGameData.GetOffset("m_nFallenSurvivors");
-    g_iOff_m_FallenSurvivorTimer = hGameData.GetOffset("m_FallenSurvivorTimer");
-    StartPrepSDKCall(SDKCall_Raw);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "TerrorNavMesh::GetLastCheckpoint");
-    PrepSDKCall_SetReturnInfo(SDKType_PlainOldData, SDKPass_Plain);
-    g_hSDK_TerrorNavMesh_GetLastCheckpoint = EndPrepSDKCall();
-    StartPrepSDKCall(SDKCall_Raw);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "Checkpoint::GetLargestArea");
-    PrepSDKCall_SetReturnInfo(SDKType_PlainOldData, SDKPass_Plain);
-    g_hSDK_Checkpoint_GetLargestArea = EndPrepSDKCall();
-    PrepLinuxCreateBotCalls(hGameData);
-    InitPatchs(hGameData);
-    LoadHookAndPatches(hGameData);
-    delete hGameData;
+	g_hSDK_Checkpoint_GetLargestArea = gd.CreateSDKCallOrFail(SDKCall_Raw, SDKConf_Signature, "Checkpoint::GetLargestArea", _, _, true, ret);
+	
+	Address pAddress = gd.GetAddress("NextBotCreatePlayerBot.jumptable");
+	if (pAddress != Address_Null && LoadFromAddress(pAddress, NumberType_Int8) == 0x68)
+		PrepWindowsCreateBotCalls(pAddress);
+	else
+		PrepLinuxCreateBotCalls(gd);
+	InitPatchs(gd);
+	LoadHookAndPatches(gd);
+	delete gd;
 }
 
-void PrepLinuxCreateBotCalls(GameData hGameData = null)
+void PrepWindowsCreateBotCalls(Address pBaseAddr)
 {
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Smoker>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Smoker = EndPrepSDKCall();
+	int iOffsets[7] = {48, 60, 0, 24, 12, 36, 72};
+	for (int i = 0; i < 7; i++)
+	{
+		Address pJumpAddr	= pBaseAddr + view_as<Address>(iOffsets[i]);
+		Address pFuncRefAddr	= pJumpAddr + view_as<Address>(6);
+		int funcRelOffset	= LoadFromAddress(pFuncRefAddr, NumberType_Int32);
+		Address pCallOffsetBase	= pJumpAddr + view_as<Address>(10);
+		Address pNextBotCreatePlayerBotTAddr = pCallOffsetBase + view_as<Address>(funcRelOffset);
 
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Boomer>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Boomer = EndPrepSDKCall();
-        
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Hunter>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Hunter = EndPrepSDKCall();
+		StartPrepSDKCall(SDKCall_Static);
+		if (!PrepSDKCall_SetAddress(pNextBotCreatePlayerBotTAddr))
+			SetFailState("Unable to find NextBotCreatePlayer<%s> address in memory.", g_sZombieClass[i]);
+		PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
+		PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
+		g_hSDK_NextBotCreatePlayerBot[i] = EndPrepSDKCall();
+    }
+}
 
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Spitter>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Spitter = EndPrepSDKCall();
-
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Jockey>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Jockey = EndPrepSDKCall();
-        
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Charger>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Charger = EndPrepSDKCall();
-        
-    StartPrepSDKCall(SDKCall_Static);
-    PrepSDKCall_SetFromConf(hGameData, SDKConf_Signature, "NextBotCreatePlayerBot<Tank>");
-    PrepSDKCall_AddParameter(SDKType_String, SDKPass_Pointer);
-    PrepSDKCall_SetReturnInfo(SDKType_CBasePlayer, SDKPass_Pointer);
-    g_hSDK_NextBotCreatePlayerBot_Tank = EndPrepSDKCall();
+void PrepLinuxCreateBotCalls(GameDataWrapper hGameData)
+{
+	SDKCallParamsWrapper param1[] =
+	{
+		{SDKType_String, SDKPass_Pointer},
+	};
+	SDKCallParamsWrapper ret1 = { SDKType_CBasePlayer, SDKPass_Pointer };
+	static char sSigName[32];
+	for (int i = 0; i < 7; i++)
+	{
+		Format(sSigName, sizeof(sSigName), "NextBotCreatePlayerBot<%s>", g_sZombieClass[i]);
+		g_hSDK_NextBotCreatePlayerBot[i] = hGameData.CreateSDKCallOrFail(SDKCall_Static, SDKConf_Signature, sSigName, param1, sizeof(param1), true, ret1);
+	}
 }
 
 void InitPatchs(GameData hGameData = null)
@@ -310,64 +371,58 @@ void InitPatchs(GameData hGameData = null)
     LoadFromAddress(g_pStatsCondition, NumberType_Int8);
 }
 
-void LoadHookAndPatches(GameData hGameData = null)
+void LoadHookAndPatches(GameDataWrapper hGameData)
 {
-    int iOffset = hGameData.GetOffset("CTerrorWeapon::GetReloadDurationModifier");
-    hReloadModifier = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
+	int iOffset = hGameData.GetOffset("CTerrorWeapon::GetReloadDurationModifier");
+	hReloadModifier = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
 
-    iOffset = hGameData.GetOffset("CTerrorGun::GetRateOfFire");
-    hRateOfFire = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CTerrorGun::GetRateOfFire");
+	hRateOfFire = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
 
-    iOffset = hGameData.GetOffset("CBaseBeltItem::GetUseTimerDuration");
-    hItemUseDuration = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CBaseBeltItem::GetUseTimerDuration");
+	hItemUseDuration = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
     
-    iOffset = hGameData.GetOffset("CRifle_Desert::PrimaryAttack");
-    hDesertBurstFire = new DynamicHook(iOffset, HookType_Entity, ReturnType_Void, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CRifle_Desert::PrimaryAttack");
+	hDesertBurstFire = new DynamicHook(iOffset, HookType_Entity, ReturnType_Void, ThisPointer_CBaseEntity);
     
-    g_DesertBurstOffset = hGameData.GetOffset("CRifle_Desert::BurstTimes_StartOffset");
+	g_DesertBurstOffset = hGameData.GetOffset("CRifle_Desert::BurstTimes_StartOffset");
     
-    iOffset = hGameData.GetOffset("CTerrorWeapon::GetDeployDurationModifier");
-    hDeployModifier = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CTerrorWeapon::GetDeployDurationModifier");
+	hDeployModifier = new DynamicHook(iOffset, HookType_Entity, ReturnType_Float, ThisPointer_CBaseEntity);
 
-    iOffset = hGameData.GetOffset("CTerrorWeapon::Deploy");
-    hDeployGun = new DynamicHook(iOffset, HookType_Entity, ReturnType_Unknown, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CTerrorWeapon::Deploy");
+	hDeployGun = new DynamicHook(iOffset, HookType_Entity, ReturnType_Unknown, ThisPointer_CBaseEntity);
 
-    iOffset = hGameData.GetOffset("CBaseCSGrenade::PrimaryAttack");
-    hGrenadePrimaryAttack = new DynamicHook(iOffset, HookType_Entity, ReturnType_Void, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CBaseCSGrenade::PrimaryAttack");
+	hGrenadePrimaryAttack = new DynamicHook(iOffset, HookType_Entity, ReturnType_Void, ThisPointer_CBaseEntity);
 
-    iOffset = hGameData.GetOffset("CBaseCSGrenade::StartGrenadeThrow");
-    hStartThrow = new DynamicHook(iOffset, HookType_Entity, ReturnType_Edict, ThisPointer_CBaseEntity);
+	iOffset = hGameData.GetOffset("CBaseCSGrenade::StartGrenadeThrow");
+	hStartThrow = new DynamicHook(iOffset, HookType_Entity, ReturnType_Edict, ThisPointer_CBaseEntity);
 
-    DynamicDetour hDetour;
-    hDetour = DynamicDetour.FromConf(hGameData, "CTerrorMeleeWeapon::StartMeleeSwing");
-    hDetour.Enable(Hook_Pre, OnMeleeSwingPre);
-    hDetour.Enable(Hook_Post, OnMeleeSwingpPost);
-    hDetour = DynamicDetour.FromConf(hGameData, "CTerrorMeleeWeapon::TestMeleeSwingCollision");
-    hDetour.Enable(Hook_Pre, HookPre_TrySwing);
-    hDetour.Enable(Hook_Post, HookPost_TrySwing);
-    delete hDetour;
+	delete hGameData.CreateDetourOrFail("CTerrorMeleeWeapon::StartMeleeSwing", OnMeleeSwingPre, OnMeleeSwingpPost);
+	delete hGameData.CreateDetourOrFail("CTerrorMeleeWeapon::TestMeleeSwingCollision", HookPre_TrySwing, HookPost_TrySwing);
 
-    Address patch = hGameData.GetAddress("CTerrorGun::GetRateOfFire");
-    if (patch) {
-        int offset = hGameData.GetOffset("CTerrorGun::GetRateOfFire_patch");
-        if (offset != -1) {
-            if (LoadFromAddress(patch + view_as<Address>(offset), NumberType_Int8) == 0x74) {
-                CTerrorGun__GetRateOfFire_byte_address = patch + view_as<Address>(offset);
-                StoreToAddress(CTerrorGun__GetRateOfFire_byte_address, 0xEB, NumberType_Int8);
-            }
-        }
-    }
+	Address patch = hGameData.GetAddress("CTerrorGun::GetRateOfFire");
+	if (patch) {
+		int offset = hGameData.GetOffset("CTerrorGun::GetRateOfFire_patch");
+		if (offset != -1) {
+			if (LoadFromAddress(patch + view_as<Address>(offset), NumberType_Int8) == 0x74) {
+				CTerrorGun__GetRateOfFire_byte_address = patch + view_as<Address>(offset);
+				StoreToAddress(CTerrorGun__GetRateOfFire_byte_address, 0xEB, NumberType_Int8);
+			}
+		}
+	}
 
-    patch = GameConfGetAddress(hGameData, "CPistol::GetRateOfFire");
-    if (patch) {
-        int offset = hGameData.GetOffset("CPistol::GetRateOfFire_patch");
-        if (offset != -1) {
-            if (LoadFromAddress(patch + view_as<Address>(offset), NumberType_Int8) == 0x74) {
-                CPistol__GetRateOfFire_byte_address = patch + view_as<Address>(offset);
-                StoreToAddress(CPistol__GetRateOfFire_byte_address, 0xEB, NumberType_Int8);
-            }
-        }
-    }
+	patch = hGameData.GetAddress("CPistol::GetRateOfFire");
+	if (patch) {
+		int offset = hGameData.GetOffset("CPistol::GetRateOfFire_patch");
+		if (offset != -1) {
+			if (LoadFromAddress(patch + view_as<Address>(offset), NumberType_Int8) == 0x74) {
+				CPistol__GetRateOfFire_byte_address = patch + view_as<Address>(offset);
+				StoreToAddress(CPistol__GetRateOfFire_byte_address, 0xEB, NumberType_Int8);
+			}
+		}
+	}
 }
 
 void StatsConditionPatch(bool patch)
@@ -1417,7 +1472,7 @@ int CreateInfectedBot(int client, int type)
     int ent = -1;
     switch (type) {
         case 1: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Smoker, "Smoker");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[0], "Smoker");
             if (ent == -1) {
                 return -1;
             }
@@ -1426,7 +1481,7 @@ int CreateInfectedBot(int client, int type)
             CPrintToChatAll("%s{G}%N {D}生成了一个AI的[{R}Smoker{D}]", PLUGIN_TAG, client);
         }
         case 2: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Boomer, "Boomer");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[1], "Boomer");
             if (ent == -1) {
                 return -1;
             }
@@ -1435,7 +1490,7 @@ int CreateInfectedBot(int client, int type)
             CPrintToChatAll("%s{G}%N {D}生成了一个AI的[{R}Boomer{D}]", PLUGIN_TAG, client);
         }
         case 3: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Hunter, "Hunter");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[2], "Hunter");
             if (ent == -1) {
                 return -1;
             }
@@ -1444,7 +1499,7 @@ int CreateInfectedBot(int client, int type)
             CPrintToChatAll("%s{G}%N {D}生成了一个AI的[{R}Hunter{D}]", PLUGIN_TAG, client);
         }
         case 4: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Spitter, "Spitter");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[3], "Spitter");
             if (ent == -1) {
                 return -1;
             }
@@ -1453,7 +1508,7 @@ int CreateInfectedBot(int client, int type)
             CPrintToChatAll("%s{G}%N {D}生成了一个AI的[{R}Spitter{D}]", PLUGIN_TAG, client);
         }
         case 5: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Jockey, "Jockey");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[4], "Jockey");
             if (ent == -1) {
                 return -1;
             }
@@ -1462,7 +1517,7 @@ int CreateInfectedBot(int client, int type)
             CPrintToChatAll("%s{G}%N {D}生成了一个AI的[{R}Jockey{D}]", PLUGIN_TAG, client);
         }
         case 6: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Charger, "Charger");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[5], "Charger");
             if (ent == -1) {
                 return -1;
             }
@@ -1471,7 +1526,7 @@ int CreateInfectedBot(int client, int type)
             CPrintToChatAll("%s{G}%N {D}生成了一个AI的[{R}Charger{D}]", PLUGIN_TAG, client);
         }
         case 8: {
-            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot_Tank, "Tank");
+            ent = SDKCall(g_hSDK_NextBotCreatePlayerBot[6], "Tank");
             if (ent == -1) {
                 return -1;
             }
